@@ -1,0 +1,185 @@
+Forward Error Correction (FEC) encoders and decoders.
+
+Implemented:
+  - ConvolutionalCode : rate-1/2 constraint-length-7 encoder + Viterbi decoder
+  - RepetitionCode    : simple Nx repetition (baseline / educational)
+  - HammingCode       : (7,4) Hamming code
+
+For production LDPC, use the `ldpc` package:
+    pip install ldpc
+    from ldpc import bp_decoder, make_ldpc
+"""
+
+import numpy as np
+from typing import List, Tuple
+
+
+# ── Repetition Code (baseline) ────────────────────────────────────────
+
+class RepetitionCode:
+    """Rate-1/N repetition code. Simple but very low throughput."""
+
+    def __init__(self, N: int = 3):
+        self.N = N
+        self.rate = 1.0 / N
+
+    def encode(self, bits: np.ndarray) -> np.ndarray:
+        return np.repeat(bits, self.N)
+
+    def decode(self, bits: np.ndarray) -> np.ndarray:
+        bits = np.asarray(bits).reshape(-1, self.N)
+        return (bits.sum(axis=1) > self.N / 2).astype(np.uint8)
+
+
+# ── (7,4) Hamming Code ────────────────────────────────────────────────
+
+class HammingCode:
+    """
+    (7,4) Hamming single-error-correcting code.
+    Processes input in 4-bit blocks.
+    """
+
+    # Generator matrix [4×7]
+    G = np.array([
+        [1, 0, 0, 0, 0, 1, 1],
+        [0, 1, 0, 0, 1, 0, 1],
+        [0, 0, 1, 0, 1, 1, 0],
+        [0, 0, 0, 1, 1, 1, 1],
+    ], dtype=np.uint8)
+
+    # Parity check matrix [3×7]
+    H = np.array([
+        [0, 1, 1, 1, 1, 0, 0],
+        [1, 0, 1, 1, 0, 1, 0],
+        [1, 1, 0, 1, 0, 0, 1],
+    ], dtype=np.uint8)
+
+    rate = 4 / 7
+
+    def encode(self, bits: np.ndarray) -> np.ndarray:
+        bits = np.asarray(bits)
+        pad = (-len(bits)) % 4
+        bits = np.concatenate([bits, np.zeros(pad, dtype=np.uint8)])
+        blocks = bits.reshape(-1, 4)
+        codewords = (blocks @ self.G) % 2
+        return codewords.flatten()
+
+    def decode(self, bits: np.ndarray) -> np.ndarray:
+        bits = np.asarray(bits)
+        pad = (-len(bits)) % 7
+        bits = np.concatenate([bits, np.zeros(pad, dtype=np.uint8)])
+        blocks = bits.reshape(-1, 7)
+        decoded = []
+        for cw in blocks:
+            syndrome = (self.H @ cw) % 2
+            err_pos = int("".join(syndrome.astype(str)), 2) - 1
+            if 0 <= err_pos < 7:
+                cw = cw.copy()
+                cw[err_pos] ^= 1
+            decoded.append(cw[:4])
+        return np.array(decoded, dtype=np.uint8).flatten()
+
+
+# ── Rate-1/2 Convolutional Code + Viterbi Decoder ────────────────────
+
+class ConvolutionalCode:
+    """
+    Rate-1/2 convolutional code with constraint length K=7.
+    Polynomials: g1=0o171, g2=0o133 (NASA standard for deep space).
+
+    Encoder: streams 1 input bit → 2 output bits.
+    Decoder: soft-decision Viterbi algorithm.
+    """
+
+    K   = 7             # constraint length
+    g1  = 0b1111001     # generator polynomial 1 (octal 171)
+    g2  = 0b1011011     # generator polynomial 2 (octal 133)
+    n_states = 2 ** (K - 1)   # 64 states
+    rate = 0.5
+
+    def __init__(self):
+        self._build_trellis()
+
+    def _build_trellis(self):
+        """Precompute next_state and output tables for all (state, input) pairs."""
+        K = self.K
+        n = self.n_states
+        self.next_state = np.zeros((n, 2), dtype=int)
+        self.output     = np.zeros((n, 2, 2), dtype=np.uint8)  # [state, input, bit]
+
+        for state in range(n):
+            for inp in range(2):
+                reg = ((state << 1) | inp) & ((1 << K) - 1)
+                out1 = bin(reg & self.g1).count("1") % 2
+                out2 = bin(reg & self.g2).count("1") % 2
+                next_s = reg >> 1
+                self.next_state[state, inp] = next_s
+                self.output[state, inp] = [out1, out2]
+
+    def encode(self, bits: np.ndarray) -> np.ndarray:
+        """bits → encoded bits (2× longer)."""
+        bits = np.asarray(bits, dtype=np.uint8)
+        state = 0
+        encoded = np.zeros(len(bits) * 2, dtype=np.uint8)
+        for i, b in enumerate(bits):
+            encoded[2*i : 2*i+2] = self.output[state, b]
+            state = self.next_state[state, b]
+        return encoded
+
+    def decode(self, llr: np.ndarray) -> np.ndarray:
+        """
+        Viterbi decoder with soft-decision LLR inputs.
+
+        Args:
+            llr: Log-likelihood ratios (received soft symbols, shape [2N])
+                 Positive LLR → bit=0, Negative LLR → bit=1
+        Returns:
+            decoded bits (shape [N])
+        """
+        n = self.n_states
+        N = len(llr) // 2
+        INF = 1e9
+
+        # Path metrics [n_states]
+        pm = np.full(n, INF)
+        pm[0] = 0.0
+
+        # Survivor paths [N, n_states]
+        survivors = np.zeros((N, n), dtype=np.int8)
+
+        for t in range(N):
+            r0, r1 = llr[2*t], llr[2*t + 1]
+            new_pm = np.full(n, INF)
+
+            for state in range(n):
+                if pm[state] == INF:
+                    continue
+                for inp in range(2):
+                    ns = self.next_state[state, inp]
+                    o0, o1 = self.output[state, inp]
+                    # Branch metric: euclidean distance to received LLR
+                    bm = (r0 * (1 - 2*o0)) + (r1 * (1 - 2*o1))
+                    cand = pm[state] - bm
+                    if cand < new_pm[ns]:
+                        new_pm[ns] = cand
+                        survivors[t, ns] = inp
+
+            pm = new_pm
+
+        # Traceback from best final state
+        best_state = int(np.argmin(pm))
+        bits_out = np.zeros(N, dtype=np.uint8)
+        state = best_state
+        for t in range(N - 1, -1, -1):
+            bits_out[t] = survivors[t, state]
+            # Find previous state
+            for s in range(n):
+                for inp in range(2):
+                    if self.next_state[s, inp] == state and survivors[t, state] == inp:
+                        state = s
+                        break
+                else:
+                    continue
+                break
+
+        return bits_out
