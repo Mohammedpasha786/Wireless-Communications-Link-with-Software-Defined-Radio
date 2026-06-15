@@ -1,0 +1,23 @@
+# configs/qpsk_awgn.yaml
+# QPSK over AWGN channel — balanced baseline configuration
+
+modulation: QPSK
+channel: awgn
+fec: hamming
+snr_db: 15.0
+n_bits: 50000
+
+sync:
+  costas_loop_bw: 0.01
+  costas_damping: 0.707
+  gardner_loop_bw: 0.005
+  frame_sync_threshold: 0.7
+
+hardware:
+  device: simulation       # options: simulation | pluto | usrp | hackrf
+  sample_rate: 1.0e6       # samples per second
+  center_freq: 915.0e6     # carrier frequency [Hz]
+  tx_gain_db: 30.0
+  rx_gain_db: 30.0
+
+optimize: null             # options: null | throughput | reliability | security
